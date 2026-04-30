@@ -1,55 +1,31 @@
-use std::os::fd::AsRawFd;
-
 use tokio::net::TcpStream;
 
-use super::hpack;
-
-const HTTP2_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-
-/// HTTP/2 frame types we care about.
-const FRAME_TYPE_HEADERS: u8 = 0x01;
-
-/// HEADERS frame flag bits.
-const HEADERS_FLAG_PADDED: u8 = 0x08;
-const HEADERS_FLAG_PRIORITY: u8 = 0x20;
-
-pub enum HttpConnectionType {
-    UNSPECIFIED,
-    HTTP1,
-    HTTP2,
+#[derive(Debug, PartialEq)]
+pub enum RequestKind {
+    /// POST with a base64-encoded body — path is /version/service/route.
+    Invocation,
+    /// GET for service metadata — path starts with /metadata.
+    Metadata,
 }
 
 pub struct HttpConnection {
-    pub connection_type: HttpConnectionType,
+    pub kind: RequestKind,
+    pub version: String,
+    pub service: String,
+    pub route: String,
     pub raw_path: String,
-    pub service_name: String,
     pub tcp_stream: TcpStream,
 }
 
-struct PartialHttpConnection {
-    connection_type: HttpConnectionType,
-    raw_path: String,
-    service_name: String,
-}
-
-impl Default for PartialHttpConnection {
-    fn default() -> Self {
-        Self { connection_type: HttpConnectionType::UNSPECIFIED, raw_path: Default::default(), service_name: Default::default() }
-    }
-}
-
 impl HttpConnection {
-    /// Peek at an accepted TCP stream to determine protocol and extract the
-    /// request path **without consuming any bytes** from the stream.  The
-    /// underlying file descriptor can therefore be handed off to another
-    /// process unmodified.
+    /// Peek at an accepted TCP stream to extract the HTTP/1.1 request method
+    /// and path **without consuming any bytes** from the stream.
     pub async fn from_tcp_stream(stream: TcpStream) -> Result<Self, Box<dyn std::error::Error>> {
         stream.readable().await?;
 
         let mut peek_buf = [0u8; 4096];
-        let partial_http_connection: PartialHttpConnection;
 
-        'reading_loop: loop {
+        loop {
             let n = stream.peek(&mut peek_buf).await?;
             if n == 0 {
                 return Err("connection closed".into());
@@ -57,181 +33,218 @@ impl HttpConnection {
 
             let buf = &peek_buf[..n];
 
-            // We need at least a handful of bytes before we can decide anything.
-            if n < 9 {
-                // Not enough data yet.  See comment below about timeout.
-                // If fewer than 9 bytes are ever sent this loops forever —
-                // the caller should wrap `from_tcp_stream` in a
-                // `tokio::time::timeout`.
-                continue 'reading_loop;
+            // Need enough bytes to see at least "GET / HTTP/1.1\r\n".
+            if n < 16 {
+                continue;
             }
 
-            // ---------------------------------------------------------------
-            // HTTP/1.x detection — check for a known method token.
-            // ---------------------------------------------------------------
-            if buf.starts_with(b"GET ")
-                || buf.starts_with(b"POST ")
-                || buf.starts_with(b"PUT ")
-                || buf.starts_with(b"HEAD ")
-                || buf.starts_with(b"DELETE ")
-            {
-                partial_http_connection = Self::parse_http1(buf)?;
-                break 'reading_loop;
-            }
-
-            // ---------------------------------------------------------------
-            // HTTP/2 detection — look for the 24-byte connection preface.
-            // ---------------------------------------------------------------
-            if n >= 24 && buf[..24] == *HTTP2_PREFACE {
-                match Self::parse_http2(buf) {
-                    Ok(Some(conn)) => {
-                        partial_http_connection = conn;
-                        break 'reading_loop;
-                    },
-                    Ok(None) => continue, // need more data from the socket
-                    Err(e) => return Err(e),
-                }
-            }
-
-            // If we have ≥24 bytes and nothing matched, it is not a protocol
-            // we understand.
-            if n >= 24 {
-                return Err("unknown protocol".into());
+            if buf.starts_with(b"POST ") {
+                return Self::parse_invocation(buf, stream);
+            } else if buf.starts_with(b"GET ") {
+                return Self::parse_metadata(buf, stream);
+            } else {
+                return Err("unsupported HTTP method: only GET and POST are accepted".into());
             }
         }
+    }
 
-        match partial_http_connection.connection_type {
-            HttpConnectionType::UNSPECIFIED => panic!("partial http connection never set in reading loop"),
-            HttpConnectionType::HTTP1 => {},
-            HttpConnectionType::HTTP2 => {},
-        };
+    /// Parse a POST request as an invocation.
+    /// Path must be /version/service/route and body must be valid base64.
+    fn parse_invocation(
+        buf: &[u8],
+        stream: TcpStream,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let path = extract_request_path(buf)?;
+        let (version, service, route) = parse_invocation_path(path)?;
 
-        return Ok(Self {
-            connection_type: partial_http_connection.connection_type,
-            raw_path: partial_http_connection.raw_path,
-            service_name: partial_http_connection.service_name,
+        let body = extract_body(buf)?;
+        validate_base64(body)?;
+
+        Ok(Self {
+            kind: RequestKind::Invocation,
+            version: version.to_string(),
+            service: service.to_string(),
+            route: route.to_string(),
+            raw_path: path.to_string(),
             tcp_stream: stream,
         })
     }
 
-    // -----------------------------------------------------------------------
-    // HTTP/1.x
-    // -----------------------------------------------------------------------
+    /// Parse a GET request as a metadata lookup.
+    /// Path must start with /metadata.
+    fn parse_metadata(buf: &[u8], stream: TcpStream) -> Result<Self, Box<dyn std::error::Error>> {
+        let path = extract_request_path(buf)?;
 
-    fn parse_http1(buf: &[u8]) -> Result<PartialHttpConnection, Box<dyn std::error::Error>> {
-        // RFC 2616 §5.1  Request-Line = Method SP Request-URI SP HTTP-Version CRLF
-        let parts: Vec<&[u8]> = buf.splitn(4, |b| *b == b' ').collect();
-        if parts.len() < 3 {
-            return Err("invalid HTTP/1 request line".into());
+        if !path.starts_with("metadata/") && path != "metadata" {
+            return Err("GET requests must target /metadata".into());
         }
 
-        let target =
-            std::str::from_utf8(parts[1]).map_err(|_| "request-target is not valid UTF-8")?;
-
-        if target == "*" {
-            return Err("OPTIONS * is not a routable request-target".into());
-        }
-
-        let path = target
-            .strip_prefix('/')
-            .ok_or("expected request-target to start with /")?;
-
-        let service_name = extract_service_name(path);
-
-        Ok(PartialHttpConnection {
-            connection_type: HttpConnectionType::HTTP1,
+        Ok(Self {
+            kind: RequestKind::Metadata,
+            version: String::new(),
+            service: String::new(),
+            route: String::new(),
             raw_path: path.to_string(),
-            service_name: service_name.to_string(),
+            tcp_stream: stream,
         })
-    }
-
-    // -----------------------------------------------------------------------
-    // HTTP/2
-    // -----------------------------------------------------------------------
-
-    /// Try to locate the first HEADERS frame after the connection preface and
-    /// extract `:path` from its HPACK-encoded header block.
-    ///
-    /// Returns `Ok(None)` when the peek buffer doesn't contain the complete
-    /// HEADERS frame yet (caller should peek again with more data).
-    fn parse_http2(
-        buf: &[u8],
-    ) -> Result<Option<PartialHttpConnection>, Box<dyn std::error::Error>> {
-        // Skip the 24-byte client connection preface.
-        let mut pos: usize = 24;
-
-        // Walk frames until we hit a HEADERS frame.
-        loop {
-            // Need at least 9 bytes for the frame header.
-            if pos + 9 > buf.len() {
-                return Ok(None);
-            }
-
-            let frame_len = u32::from_be_bytes([0, buf[pos], buf[pos + 1], buf[pos + 2]]) as usize;
-            let frame_type = buf[pos + 3];
-            let flags = buf[pos + 4];
-            let frame_end = pos + 9 + frame_len;
-
-            if frame_type != FRAME_TYPE_HEADERS {
-                // Not the frame we want — skip it.
-                if frame_end > buf.len() {
-                    // Frame body not fully available yet.
-                    return Ok(None);
-                }
-                pos = frame_end;
-                continue;
-            }
-
-            // Found a HEADERS frame — make sure the full payload is buffered.
-            if frame_end > buf.len() {
-                return Ok(None);
-            }
-
-            // Locate the header-block fragment within the HEADERS payload.
-            let mut hdr_start = pos + 9;
-            let mut hdr_end = frame_end;
-
-            if flags & HEADERS_FLAG_PADDED != 0 {
-                if hdr_start >= hdr_end {
-                    return Err("HEADERS frame too short for pad length".into());
-                }
-                let pad_len = buf[hdr_start] as usize;
-                hdr_start += 1;
-                hdr_end -= pad_len;
-            }
-
-            if flags & HEADERS_FLAG_PRIORITY != 0 {
-                // 4-byte stream dependency + 1-byte weight.
-                hdr_start += 5;
-            }
-
-            if hdr_start > hdr_end {
-                return Err("HEADERS frame payload too small".into());
-            }
-
-            let header_block = &buf[hdr_start..hdr_end];
-
-            let path = hpack::find_path_header(header_block)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-
-            let trimmed = path.strip_prefix('/').unwrap_or(&path);
-            let service_name = extract_service_name(trimmed);
-
-            return Ok(Some(PartialHttpConnection {
-                connection_type: HttpConnectionType::HTTP2,
-                raw_path: trimmed.to_string(),
-                service_name: service_name.to_string(),
-            }));
-        }
     }
 }
 
-/// Given a path with the leading `/` already stripped (e.g.
-/// `package.ServiceName/MethodName`), return everything before the final
-/// `/` — i.e. the gRPC service name.
-fn extract_service_name(path: &str) -> &str {
-    match path.rsplit_once('/') {
-        Some((service, _method)) => service,
-        None => path,
+/// Extract the request-target from an HTTP/1.1 request line, stripping the
+/// leading `/`.
+fn extract_request_path(buf: &[u8]) -> Result<&str, Box<dyn std::error::Error>> {
+    // RFC 2616 §5.1  Request-Line = Method SP Request-URI SP HTTP-Version CRLF
+    let parts: Vec<&[u8]> = buf.splitn(4, |b| *b == b' ').collect();
+    if parts.len() < 3 {
+        return Err("invalid HTTP/1.1 request line".into());
+    }
+
+    let target =
+        std::str::from_utf8(parts[1]).map_err(|_| "request-target is not valid UTF-8")?;
+
+    target
+        .strip_prefix('/')
+        .ok_or_else(|| "expected request-target to start with /".into())
+}
+
+/// Parse a POST path of the form `version/service/route` (leading `/` already
+/// stripped).
+fn parse_invocation_path(path: &str) -> Result<(&str, &str, &str), Box<dyn std::error::Error>> {
+    let segments: Vec<&str> = path.splitn(3, '/').collect();
+    if segments.len() != 3 || segments.iter().any(|s| s.is_empty()) {
+        return Err(
+            format!("invalid path '/{path}': expected format /version/service/route").into(),
+        );
+    }
+    Ok((segments[0], segments[1], segments[2]))
+}
+
+/// Locate the body in a raw HTTP/1.1 request buffer (everything after the
+/// `\r\n\r\n` header terminator).
+fn extract_body(buf: &[u8]) -> Result<&[u8], Box<dyn std::error::Error>> {
+    let header_end = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("incomplete HTTP headers in peek buffer")?;
+    Ok(&buf[header_end + 4..])
+}
+
+/// Validate that `data` is valid standard base64 (RFC 4648 §4).
+/// Accepts A-Z, a-z, 0-9, +, /, and trailing `=` padding. Rejects empty body.
+fn validate_base64(data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    if data.is_empty() {
+        return Err("POST body must not be empty".into());
+    }
+
+    let mut padding_started = false;
+    for &b in data {
+        if b == b'=' {
+            padding_started = true;
+        } else if padding_started {
+            return Err("invalid base64: data after padding".into());
+        } else if !(b.is_ascii_alphanumeric() || b == b'+' || b == b'/') {
+            return Err(format!("invalid base64 byte: 0x{b:02x}").into());
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- parse_invocation_path ------------------------------------------------
+
+    #[test]
+    fn parse_valid_invocation_path() {
+        let (v, s, r) = parse_invocation_path("v1/users/list").unwrap();
+        assert_eq!(v, "v1");
+        assert_eq!(s, "users");
+        assert_eq!(r, "list");
+    }
+
+    #[test]
+    fn parse_invocation_path_with_nested_route() {
+        let (v, s, r) = parse_invocation_path("v2/orders/get/123").unwrap();
+        assert_eq!(v, "v2");
+        assert_eq!(s, "orders");
+        assert_eq!(r, "get/123");
+    }
+
+    #[test]
+    fn parse_invocation_path_missing_segment() {
+        assert!(parse_invocation_path("v1/users").is_err());
+    }
+
+    #[test]
+    fn parse_invocation_path_empty_segment() {
+        assert!(parse_invocation_path("v1//method").is_err());
+    }
+
+    #[test]
+    fn parse_invocation_path_single_segment() {
+        assert!(parse_invocation_path("v1").is_err());
+    }
+
+    // -- validate_base64 ------------------------------------------------------
+
+    #[test]
+    fn base64_valid_no_padding() {
+        validate_base64(b"SGVsbG8gV29ybGQ").unwrap();
+    }
+
+    #[test]
+    fn base64_valid_with_padding() {
+        validate_base64(b"SGVsbG8=").unwrap();
+    }
+
+    #[test]
+    fn base64_valid_double_padding() {
+        validate_base64(b"SG8=").unwrap();
+    }
+
+    #[test]
+    fn base64_invalid_character() {
+        assert!(validate_base64(b"SGVs!G8=").is_err());
+    }
+
+    #[test]
+    fn base64_data_after_padding() {
+        assert!(validate_base64(b"SG8=abc").is_err());
+    }
+
+    #[test]
+    fn base64_empty_body() {
+        assert!(validate_base64(b"").is_err());
+    }
+
+    // -- extract_body ---------------------------------------------------------
+
+    #[test]
+    fn extract_body_from_request() {
+        let req = b"POST /v1/svc/op HTTP/1.1\r\nHost: x\r\n\r\nSGVsbG8=";
+        let body = extract_body(req).unwrap();
+        assert_eq!(body, b"SGVsbG8=");
+    }
+
+    #[test]
+    fn extract_body_missing_headers_end() {
+        let req = b"POST /v1/svc/op HTTP/1.1\r\nHost: x";
+        assert!(extract_body(req).is_err());
+    }
+
+    // -- extract_request_path -------------------------------------------------
+
+    #[test]
+    fn extract_path_get() {
+        let req = b"GET /metadata HTTP/1.1\r\n";
+        assert_eq!(extract_request_path(req).unwrap(), "metadata");
+    }
+
+    #[test]
+    fn extract_path_post() {
+        let req = b"POST /v1/svc/invoke HTTP/1.1\r\n";
+        assert_eq!(extract_request_path(req).unwrap(), "v1/svc/invoke");
     }
 }
