@@ -1,0 +1,4 @@
+[workspace]
+members = ["dispatcher", "runner"]
+exclude = ["example/rust"]
+resolver = "3"
