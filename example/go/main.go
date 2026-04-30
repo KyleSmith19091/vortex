@@ -2,24 +2,26 @@ package main
 
 import (
 	"fmt"
-	"sync"
+	"log"
+	"net/http"
+
+	"github.com/stealthrocket/net/wasip1"
 )
 
-func init() {
-	fmt.Println("Init run")
-}
-
 func main() {
-	wg := sync.WaitGroup{}
-	for i := range 4 {
-		go func() {
-			fmt.Printf("Thread: %d done\n", i)
-			wg.Done()
-		}()
-		wg.Add(1)
+	// Use WASI‑socket‑aware listener.
+	listener, err := wasip1.Listen("tcp", "0.0.0.0:8080")
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
 	}
 
-	wg.Wait()
+	// Single test path.
+	http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "pong from Go WASI TCP server\n")
+	})
 
-	fmt.Println("Hello world")
+	log.Println("listening on http://0.0.0.0:8080/ping")
+	if err := http.Serve(listener, nil); err != nil {
+		log.Fatalf("http.Serve: %v", err)
+	}
 }

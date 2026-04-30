@@ -1,0 +1,15 @@
+[package]
+name = "runner"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.22"
+bytes = "1.11.1"
+libc = "0.2"
+object_store = "0.12.5"
+tokio = { version = "1.52.1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+wasmtime = "44.0.0"
+wasmtime-wasi = "44.0.0"
+wasmtime-wasi-http = "44.0.0"

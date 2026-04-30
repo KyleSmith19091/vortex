@@ -1,12 +1,9 @@
-use std::{
-    error::Error,
-    sync::{Arc, mpsc},
-};
+use std::sync::Arc;
 
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
-    sync::{Semaphore},
+    sync::{Semaphore, mpsc},
 };
 
 use crate::network::http_connection::HttpConnection;
@@ -29,7 +26,7 @@ impl Server {
         let listener = TcpListener::bind(address.clone()).await;
         match listener {
             Ok(listener) => {
-                println!("Server started");
+                println!("Server started on {address}");
                 loop {
                     let (stream, _) = listener.accept().await.unwrap();
                     let connection_clone = self.semaphore.clone();
@@ -42,6 +39,7 @@ impl Server {
             }
             Err(e) => {
                 println!("error binding to address {}: {}", address, e);
+                return;
             }
         }
     }
@@ -52,19 +50,18 @@ impl Server {
         connection_sender: mpsc::Sender<HttpConnection>,
     ) {
         match semaphore.acquire().await {
-            Ok(_) => match HttpConnection::from_tcp_stream(stream).await {
-                Ok(connection) => {
-                    match connection_sender.send(connection) {
-                        Ok(_) => {/* Nothing to do here */},
-                        Err(_) => {
-                            println!("could not handoff new http connection in connection_sender queue");
-                        },
-                    };
+            Ok(_) => {
+                let connection = match HttpConnection::from_tcp_stream(stream).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        println!("error handling tcp connection as http connection: {e}");
+                        return;
+                    }
+                };
+                if connection_sender.send(connection).await.is_err() {
+                    println!("could not handoff new http connection in connection_sender queue");
                 }
-                Err(e) => {
-                    println!("error handling tcp connection as http connection: {}", e);
-                }
-            },
+            }
             Err(_) => {
                 println!("connection limit reached, bouncing connection");
                 match stream
